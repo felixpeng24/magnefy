@@ -56,7 +56,233 @@ for folder in class_folders:
 ### Key Decisions
 - **Class imbalance**: If one class has far fewer samples, you'll need to address this later (oversampling, undersampling, or class weights). Note it now.
 - **Which channels to use**: Your notebook uses Ch1 primarily. You may want to analyze all 4 channels or pick the most informative one. Start with one channel to keep things simple, then expand.
-- **Noise class**: Your dataset has internal, corona, and surface — but your project scope also mentions classifying "noise." You'll need to decide whether to create synthetic noise samples, find a noise dataset, or train a 3-class model instead of 4.
+- **Noise class**: Your dataset has internal, corona, and surface — but your project scope also mentions classifying "noise." See **Stage 0.5** for how to get noise samples from the Figshare dataset and by extracting quiet regions from the LEE waveforms themselves.
+
+---
+
+## Stage 0.5: Supplementary Datasets
+
+Your LEE dataset covers 3 of your 4 target classes (internal, corona, surface) but is missing **noise**. Your project scope requires a 4-class model. This section covers two additional open-access datasets that fill that gap and strengthen your training data.
+
+### Priority 1: Figshare PD & Noise Signal Dataset (Your Missing Noise Class)
+
+**Source**: Rauscher et al., "Deep learning and data augmentation for PD detection in electrical machines," *Eng. Applications of AI*, 133, 108074 (2024)
+**URL**: https://figshare.com/articles/dataset/Dataset_of_partial_discharge_and_noise_signals/24033225
+**License**: CC BY 4.0
+**Why you need it**: This is the most practical way to get labeled noise samples. The data is pre-split into train/validation/test partitions, and the companion paper includes data augmentation code that achieved 99.76% accuracy on PD vs noise classification.
+
+#### What's in it
+- **PD signals** and **noise signals** from automotive traction machine production lines
+- Pre-split into: Train (Tr0=noise, Tr1=PD), Validation (Va0, Va1), Test (Te0, Te1, Te2)
+- Binary labels: PD vs NonPD (noise)
+- Captured with EM/inductive PD sensor
+
+#### How to load it
+
+```python
+import numpy as np
+import os
+
+figshare_root = "/path/to/figshare_dataset"
+
+# The dataset uses numbered folders for splits
+# Tr0 = training noise, Tr1 = training PD
+# Va0 = validation noise, Va1 = validation PD
+# Te0/Te2 = test noise, Te1 = test PD
+noise_folders = ["Tr0", "Va0", "Te0", "Te2"]
+pd_folders = ["Tr1", "Va1", "Te1"]
+
+def load_figshare_signals(root, folders):
+    """Load all signal files from specified folders."""
+    signals = []
+    for folder in folders:
+        folder_path = os.path.join(root, folder)
+        if not os.path.exists(folder_path):
+            print(f"Warning: {folder_path} not found, skipping")
+            continue
+        for f in sorted(os.listdir(folder_path)):
+            filepath = os.path.join(folder_path, f)
+            # Check the actual file format after download — may be .npy, .csv, or .txt
+            try:
+                signal = np.load(filepath)
+            except:
+                signal = np.loadtxt(filepath)
+            signals.append(signal)
+    return signals
+
+noise_signals = load_figshare_signals(figshare_root, noise_folders)
+pd_signals = load_figshare_signals(figshare_root, pd_folders)
+print(f"Loaded {len(noise_signals)} noise signals, {len(pd_signals)} PD signals")
+```
+
+#### How to integrate with the LEE dataset
+
+The Figshare noise data will have different characteristics than the LEE data (different sensor, different equipment). You can't just blindly merge them. Here's the approach:
+
+1. **Use the noise signals as-is for your noise class**. They give the model examples of "this is what non-PD looks like."
+
+2. **Also extract noise from the LEE data itself**. The LEE waveforms contain long stretches of baseline noise between PD spikes. Extract windows from those quiet regions as additional noise samples:
+
+```python
+import scipy.io as sio
+from scipy.signal import find_peaks
+
+def extract_noise_windows_from_lee(mat_file, window_size=1000, num_windows=10):
+    """
+    Extract noise windows from quiet regions of a LEE waveform.
+    These are sections where NO PD event is occurring.
+    """
+    data = sio.loadmat(mat_file)
+    signal = data['Ch1'].flatten()
+
+    # Find PD events (same threshold as Stage 2)
+    threshold = signal.mean() + 3 * signal.std()
+    peaks, _ = find_peaks(np.abs(signal), height=threshold, distance=100)
+
+    # Create a mask of "near a PD event" regions
+    exclusion_zone = window_size * 2  # stay far from any PD spike
+    pd_mask = np.zeros(len(signal), dtype=bool)
+    for peak in peaks:
+        start = max(0, peak - exclusion_zone)
+        end = min(len(signal), peak + exclusion_zone)
+        pd_mask[start:end] = True
+
+    # Find valid noise regions (far from any PD event)
+    valid_indices = np.where(~pd_mask)[0]
+    if len(valid_indices) < window_size:
+        return []
+
+    # Randomly sample noise windows from valid regions
+    noise_windows = []
+    for _ in range(num_windows):
+        # Pick a random valid start index
+        start_pool = valid_indices[valid_indices < len(signal) - window_size]
+        if len(start_pool) == 0:
+            break
+        start = np.random.choice(start_pool)
+        window = signal[start:start + window_size]
+        noise_windows.append(window)
+
+    return noise_windows
+```
+
+3. **Balance the classes**. After combining LEE PD events + noise from both sources, check the class distribution and balance if needed (Stage 4 covers this).
+
+#### Sensor difference caveat
+The Figshare dataset uses an EM/inductive sensor on motors, not an HFCT on transformers. The noise characteristics will be different from what Magnefy's HFCT sensor sees. This is actually OK for training — the model needs to learn "what noise looks like in general" (no periodic PD pulse structure), and having diverse noise examples helps it generalize. But document this limitation in your report.
+
+---
+
+### Priority 2: VSB-TUO PD vs Corona Dataset (More PD Data + Validation)
+
+**Source**: Kabot et al., VŠB–TU Ostrava. *Nature Scientific Data* 12, 1361 (Aug 2025). DOI: 10.1038/s41597-025-05627-z
+**Data URL**: https://doi.org/10.6084/m9.figshare.28523090
+**Code URL**: https://github.com/Lukykl1/dataset_pd_corona_vsb
+**License**: CC BY 4.0
+**Why it's useful**: 1,400 labeled signals across 5 classes, peer-reviewed in Nature, includes Python loader scripts. Gives you a second independent dataset to validate that your model generalizes beyond the LEE data.
+
+#### What's in it
+- **5 discharge classes**: PD, Corona, Mixed PD+Corona, High-impedance PD, High-impedance Corona
+- **2 background conditions**: with and without high voltage applied
+- ~100 signals per class × 2 antennas = ~1,400 signals total
+- Each signal: 20 ms capture window, 10 million data points at 500 MSa/s
+- Stored as `.bin` (binary float arrays), convertible to `.npy`
+
+#### How to load it
+
+The GitHub repo provides loader scripts. Here's what the workflow looks like:
+
+```python
+import numpy as np
+
+# After cloning: git clone https://github.com/Lukykl1/dataset_pd_corona_vsb.git
+# Follow their README for download links and loader scripts
+
+# Basic loading (adjust based on their actual file structure)
+def load_vsb_signal(bin_file):
+    """Load a single VSB binary signal file."""
+    signal = np.fromfile(bin_file, dtype=np.float32)
+    return signal
+
+# Check what you get
+sample = load_vsb_signal("/path/to/vsb_dataset/pd/signal_001.bin")
+print(f"Signal length: {len(sample)}")  # expect ~10,000,000
+print(f"Duration: {len(sample) / 500e6 * 1000:.1f} ms")  # expect ~20 ms
+```
+
+#### Downsampling to match LEE (125 MSa/s)
+
+The VSB data is sampled at 500 MSa/s, 4x faster than the LEE dataset (125 MSa/s). To make them compatible, downsample by a factor of 4:
+
+```python
+from scipy.signal import decimate
+
+def downsample_to_125mhz(signal_500mhz, factor=4):
+    """
+    Downsample from 500 MSa/s to 125 MSa/s.
+    scipy.signal.decimate applies an anti-aliasing filter before downsampling
+    to prevent frequency artifacts.
+    """
+    return decimate(signal_500mhz, factor)
+
+# After downsampling:
+# - 10M points at 500 MSa/s → 2.5M points at 125 MSa/s
+# - dt changes from 2 ns to 8 ns (matches LEE)
+downsampled = downsample_to_125mhz(sample)
+print(f"Downsampled: {len(downsampled)} points at 125 MSa/s")
+```
+
+**Important**: Always downsample using `scipy.signal.decimate` (which applies an anti-aliasing filter), NOT `signal[::4]` (which just drops samples and creates aliasing artifacts).
+
+#### How to use it
+
+You have two options:
+
+**Option A: Merge into training data.** Add the VSB signals to your combined dataset, mapping their classes to yours:
+- VSB "PD" → closest to LEE "internal" (but not exact — document this)
+- VSB "Corona" → maps to LEE "corona"
+- VSB "Background (no HV)" → additional noise samples
+
+This gives you more training data but mixes sensor types (antenna vs HFCT). Use a `source` column in your DataFrame so you can track which dataset each sample came from.
+
+**Option B (Recommended): Use as a held-out validation set.** Train on LEE data only, then test on VSB data to see if your model generalizes to signals from different equipment. If it does, that's a strong result for your report. If it doesn't, that's also valuable — it tells you the model is overfitting to the LEE sensor characteristics.
+
+```python
+# Option B: Cross-dataset validation
+model.fit(X_train_lee, y_train_lee)
+
+# Test on LEE data (same-distribution performance)
+y_pred_lee = model.predict(X_test_lee)
+print("LEE test performance:")
+print(classification_report(y_test_lee, y_pred_lee))
+
+# Test on VSB data (cross-distribution generalization)
+y_pred_vsb = model.predict(X_test_vsb)
+print("VSB cross-dataset performance:")
+print(classification_report(y_test_vsb, y_pred_vsb))
+```
+
+#### Antenna vs HFCT caveat
+The VSB dataset uses contactless antennas, not HFCT sensors. The signal shape and frequency content will differ. Specifically:
+- HFCT captures current pulses in a cable/bushing — sharp, well-defined pulses
+- Antennas capture radiated EM waves — broader pulses with more environmental coupling
+
+This means features like rise_time and pulse_width may not transfer directly between datasets. Frequency-domain features (dominant_freq, spectral_centroid) are more likely to transfer. Keep this in mind when interpreting cross-dataset results.
+
+---
+
+### Dataset Integration Summary
+
+| Dataset | Classes | Sensor | Sample Rate | Your Use |
+|---|---|---|---|---|
+| LEE (UFCG) | Internal, Corona, Surface | HFCT | 125 MSa/s | Primary training data |
+| Figshare (Rauscher) | PD, Noise | EM/inductive | Varies | Noise class samples |
+| VSB-TUO (Kabot) | PD, Corona, Mixed, HI-PD, HI-Corona, Background | Antenna | 500 MSa/s → downsample to 125 | Cross-dataset validation |
+
+**Workflow**:
+1. Build your pipeline on LEE data first (Stage 0 → Stage 6)
+2. Add Figshare noise samples to create a 4-class dataset (internal, corona, surface, noise)
+3. Optionally validate on VSB data to test generalization
 
 ---
 
@@ -699,10 +925,14 @@ h5py>=3.8               # for some .mat file formats
 
 1. **Run Stage 0** on your full LEE dataset. Know exactly what you have: how many files per class, whether all files have the same structure, any anomalies.
 
-2. **Pick one file from each class** and run it through Stages 1-3 manually in a notebook. Visualize everything. Make sure the features look reasonable before scaling up.
+2. **Download the Figshare noise dataset** (Stage 0.5). You need noise samples before you can build a 4-class model. This is a quick download and gives you labeled noise data immediately.
 
-3. **Build the full pipeline** as a Python script (not just a notebook) that processes all files and outputs a single CSV of features + labels.
+3. **Pick one file from each class** (including a noise sample) and run it through Stages 1-3 manually in a notebook. Visualize everything. Make sure the features look reasonable before scaling up.
 
-4. **Train a Random Forest** as your first baseline model. It's fast, requires no tuning, and gives you feature importance for free.
+4. **Build the full pipeline** as a Python script (not just a notebook) that processes all files and outputs a single CSV of features + labels.
 
-5. **Iterate**: add features, try more models, tune hyperparameters, compare approaches.
+5. **Train a Random Forest** as your first baseline model. It's fast, requires no tuning, and gives you feature importance for free.
+
+6. **Iterate**: add features, try more models, tune hyperparameters, compare approaches.
+
+7. **(Optional) Download VSB-TUO dataset** for cross-dataset validation. Do this after your pipeline is working on LEE data — it's a "nice to have" that strengthens your report but isn't required to build the core model.
